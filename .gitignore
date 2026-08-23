@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+env/
+venv/
+.env
+.venv
+
+# Jupyter Notebooks
+.ipynb_checkpoints/
+
+# User private data (ratings, watchlists)
+datasets/user_data.json
+
+# Large datasets - exclude raw CSV if too big
+# datasets/latest_movies_2026.csv  # Keeping this tracked
+
+# IDEs
+.vscode/
+.idea/
+*.suo
+*.user
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Streamlit
+.streamlit/secrets.toml
