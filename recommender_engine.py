@@ -421,3 +421,69 @@ class RecommenderEngine:
         if not matched.empty:
             return matched.iloc[0].to_dict()
         return None
+
+    def get_watch_providers(self, movie_id, region="IN"):
+        """
+        Fetch streaming/rent/buy providers for a movie via TMDB Watch Providers API.
+        Returns dict with keys: 'stream', 'rent', 'buy' — each a list of
+        {'provider_name': str, 'logo_url': str} dicts.
+        Falls back gracefully if no API key or no data available.
+        """
+        api_key = os.getenv("TMDB_API_KEY", "")
+        result = {"stream": [], "rent": [], "buy": [], "link": ""}
+
+        if not api_key:
+            return result
+
+        try:
+            url = f"https://api.themoviedb.org/3/movie/{movie_id}/watch/providers?api_key={api_key}"
+            resp = requests.get(url, timeout=8)
+            if resp.status_code != 200:
+                return result
+
+            data = resp.json().get("results", {})
+            # Try requested region, fall back to US
+            region_data = data.get(region) or data.get("US") or {}
+
+            result["link"] = region_data.get("link", "")
+
+            def _extract_providers(provider_list):
+                out = []
+                for p in (provider_list or []):
+                    logo_path = p.get("logo_path", "")
+                    logo_url = f"https://image.tmdb.org/t/p/w92{logo_path}" if logo_path else ""
+                    out.append({
+                        "provider_name": p.get("provider_name", ""),
+                        "logo_url": logo_url
+                    })
+                return out
+
+            result["stream"] = _extract_providers(region_data.get("flatrate"))
+            result["rent"]   = _extract_providers(region_data.get("rent"))
+            result["buy"]    = _extract_providers(region_data.get("buy"))
+        except Exception:
+            pass
+
+        return result
+
+    def get_backdrop_url(self, movie_id):
+        """
+        Fetch the backdrop image URL for a movie from TMDB.
+        Returns a full URL string, or empty string on failure.
+        """
+        api_key = os.getenv("TMDB_API_KEY", "")
+        if not api_key:
+            return ""
+        try:
+            url = f"https://api.themoviedb.org/3/movie/{movie_id}/images?api_key={api_key}"
+            resp = requests.get(url, timeout=6)
+            if resp.status_code != 200:
+                return ""
+            backdrops = resp.json().get("backdrops", [])
+            if backdrops:
+                path = backdrops[0].get("file_path", "")
+                if path:
+                    return f"https://image.tmdb.org/t/p/w1280{path}"
+        except Exception:
+            pass
+        return ""
