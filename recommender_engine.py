@@ -4,6 +4,7 @@ import json
 import numpy as np
 import pandas as pd
 import requests
+from functools import lru_cache
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import linear_kernel, cosine_similarity
 
@@ -102,6 +103,18 @@ class RecommenderEngine:
                 {"movie_id": "1571", "title": "Inception", "overview": "Cobb, a skilled thief who steals valuable secrets from deep within the subconscious during dream state.", "genres": "['Action', 'Science Fiction', 'Adventure']", "keywords": "['dream', 'subconscious', 'mind heist']", "cast": "['Leonardo DiCaprio', 'Joseph Gordon-Levitt']", "director": "['Christopher Nolan']", "release_date": "2010-07-15", "popularity": 167.5, "vote_average": 8.1, "vote_count": 14000}
             ])
 
+        # Enrich the latest catalog with metadata fields used by the browse filters.
+        if os.path.exists(metadata_csv) and 'movie_id' in df.columns:
+            metadata = pd.read_csv(metadata_csv, low_memory=False)
+            metadata = metadata[metadata['id'].astype(str).str.fullmatch(r'\d+')].copy()
+            metadata['movie_id'] = metadata['id'].astype(str)
+            metadata_columns = [
+                'movie_id', 'production_companies', 'production_countries',
+                'revenue', 'runtime',
+            ]
+            available_columns = [column for column in metadata_columns if column in metadata.columns]
+            df = df.merge(metadata[available_columns].drop_duplicates('movie_id'), on='movie_id', how='left')
+
         # Clean & Normalize Columns
         df['title'] = df['title'].fillna("Unknown Title").astype(str)
         df['overview'] = df['overview'].fillna("").astype(str)
@@ -109,8 +122,9 @@ class RecommenderEngine:
         df['vote_average'] = pd.to_numeric(df.get('vote_average', 0), errors='coerce').fillna(0)
         df['vote_count'] = pd.to_numeric(df.get('vote_count', 0), errors='coerce').fillna(0)
         df['release_date'] = df.get('release_date', '').fillna('').astype(str)
+        df['year'] = df['release_date'].str.extract(r'(\d{4})', expand=False).fillna('N/A')
         
-        # Poster URL formatting
+        # Keep missing artwork empty so the UI can resolve it or omit the movie.
         def format_poster(path, title):
             if path and not pd.isna(path):
                 p_str = str(path).strip()
@@ -121,8 +135,7 @@ class RecommenderEngine:
                         return f"https://image.tmdb.org/t/p/w500{p_str}"
                     else:
                         return f"https://image.tmdb.org/t/p/w500/{p_str}"
-            clean_t = str(title).replace(' ', '+')
-            return f"https://placehold.co/300x450/1e1b4b/d8b4fe?text={clean_t}"
+            return ""
 
         df['poster_path'] = df.get('poster_path', None)
         df['full_poster_url'] = df.apply(lambda r: format_poster(r.get('poster_path'), r.get('title')), axis=1)
@@ -131,6 +144,8 @@ class RecommenderEngine:
         df['parsed_genres'] = df['genres'].apply(parse_json_column) if 'genres' in df.columns else [[]]*len(df)
         df['parsed_keywords'] = df['keywords'].apply(parse_json_column) if 'keywords' in df.columns else [[]]*len(df)
         df['parsed_cast'] = df['cast'].apply(parse_json_column) if 'cast' in df.columns else [[]]*len(df)
+        df['parsed_production_companies'] = df['production_companies'].apply(parse_json_column) if 'production_companies' in df.columns else [[]]*len(df)
+        df['parsed_countries'] = df['production_countries'].apply(parse_json_column) if 'production_countries' in df.columns else [[]]*len(df)
         
         if 'director' in df.columns:
             df['parsed_director'] = df['director'].apply(parse_json_column)
@@ -167,6 +182,14 @@ class RecommenderEngine:
             self.ratings_df = pd.read_csv(ratings_csv)
             self.ratings_df['userId'] = self.ratings_df['userId'].astype(str)
             self.ratings_df['movieId'] = self.ratings_df['movieId'].astype(str)
+            links_csv = os.path.join("datasets", "links_small.csv")
+            if os.path.exists(links_csv):
+                links = pd.read_csv(links_csv, usecols=["movieId", "tmdbId"]).dropna(subset=["tmdbId"])
+                links["movieId"] = links["movieId"].astype(str)
+                links["tmdbId"] = links["tmdbId"].astype(int).astype(str)
+                self.ratings_df = self.ratings_df.merge(links, on="movieId", how="left")
+                self.ratings_df["movieId"] = self.ratings_df["tmdbId"].fillna(self.ratings_df["movieId"])
+                self.ratings_df = self.ratings_df.drop(columns=["tmdbId"])
         else:
             self.ratings_df = pd.DataFrame([
                 {"userId": "1", "movieId": "19995", "rating": 5.0},
@@ -176,6 +199,68 @@ class RecommenderEngine:
             ])
 
         print(f"[SUCCESS] Loaded {len(self.movies_df)} movies and {len(self.ratings_df)} user ratings.")
+
+    @lru_cache(maxsize=2048)
+    def resolve_poster_url(self, title, year=""):
+        """Find artwork through TMDB, then Wikipedia when TMDB is unavailable."""
+        api_key = os.getenv("TMDB_API_KEY", "")
+        if not str(title).strip():
+            return ""
+        if api_key:
+            try:
+                params = {"api_key": api_key, "query": str(title), "include_adult": "false"}
+                if str(year).isdigit():
+                    params["year"] = str(year)
+                response = requests.get(
+                    "https://api.themoviedb.org/3/search/movie", params=params, timeout=5
+                )
+                if response.status_code == 200:
+                    for result in response.json().get("results", []):
+                        poster_path = result.get("poster_path")
+                        if poster_path:
+                            return f"https://image.tmdb.org/t/p/w500{poster_path}"
+            except Exception:
+                pass
+
+        # Wikipedia's public API provides a useful no-key fallback for films.
+        try:
+            query = f"{title} film {year}" if str(year).isdigit() else f"{title} film"
+            response = requests.get(
+                "https://en.wikipedia.org/w/api.php",
+                params={
+                    "action": "query", "format": "json", "generator": "search",
+                    "gsrsearch": query, "gsrnamespace": 0, "gsrlimit": 5,
+                    "prop": "pageimages", "piprop": "thumbnail", "pithumbsize": 500,
+                },
+                headers={"User-Agent": "WatchWise/1.0"}, timeout=5,
+            )
+            pages = response.json().get("query", {}).get("pages", {})
+            for page in pages.values():
+                thumbnail = page.get("thumbnail", {}).get("source")
+                if thumbnail:
+                    return thumbnail
+        except Exception:
+            pass
+
+        # Wikimedia Commons can contain poster scans when Wikipedia has no thumbnail.
+        try:
+            response = requests.get(
+                "https://commons.wikimedia.org/w/api.php",
+                params={
+                    "action": "query", "format": "json", "generator": "search",
+                    "gsrsearch": f"{title} movie poster", "gsrnamespace": 6,
+                    "gsrlimit": 10, "prop": "imageinfo", "iiprop": "url",
+                },
+                headers={"User-Agent": "WatchWise/1.0"}, timeout=5,
+            )
+            pages = response.json().get("query", {}).get("pages", {})
+            for page in pages.values():
+                image_url = page.get("imageinfo", [{}])[0].get("url", "")
+                if image_url.lower().endswith((".jpg", ".jpeg", ".png", ".webp")):
+                    return image_url
+        except Exception:
+            pass
+        return ""
 
     def _build_content_model(self):
         """Build TF-IDF matrix and Cosine Similarity matrix for Content-Based NLP."""
@@ -221,6 +306,29 @@ class RecommenderEngine:
         if not matched.empty and matched.iloc[0]['vote_average'] > 0:
             return float(np.clip(matched.iloc[0]['vote_average'] / 2.0, 1.0, 5.0))
         return 3.5
+
+    def add_training_ratings(self, ratings):
+        if not ratings:
+            return
+        new_ratings = pd.DataFrame(ratings)
+        new_ratings = new_ratings.rename(columns={"user_id": "userId", "movie_id": "movieId"})
+        new_ratings["userId"] = new_ratings["userId"].astype(str)
+        new_ratings["movieId"] = new_ratings["movieId"].astype(str)
+        self.ratings_df = pd.concat([self.ratings_df, new_ratings[["userId", "movieId", "rating"]]], ignore_index=True)
+        self.ratings_df = self.ratings_df.drop_duplicates(["userId", "movieId"], keep="last")
+        self._build_collaborative_model()
+
+    def retrain_with_rating(self, user_id, movie_id, rating):
+        """Persist a new user interaction in the collaborative training set and retrain SVD."""
+        user_id = str(user_id)
+        movie_id = str(movie_id)
+        rating = float(np.clip(rating, 1.0, 5.0))
+        new_rating = pd.DataFrame([{"userId": user_id, "movieId": movie_id, "rating": rating}])
+        self.ratings_df = self.ratings_df[
+            ~((self.ratings_df["userId"] == user_id) & (self.ratings_df["movieId"] == movie_id))
+        ]
+        self.ratings_df = pd.concat([self.ratings_df, new_rating], ignore_index=True)
+        self._build_collaborative_model()
 
     def get_top_ranked_movies(self, top_n=250):
         """Calculate IMDb Weighted Rating for Top N Movies (Top 10, 50, 100, 250, 500)."""

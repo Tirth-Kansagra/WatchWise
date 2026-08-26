@@ -28,6 +28,22 @@ STYLING_CSS = """
         color: #f8fafc;
     }
 
+    .landing-page {
+        min-height: 88vh;
+        display: flex;
+        align-items: flex-end;
+        padding: 8vh 7vw 10vh;
+        border-radius: 18px;
+        background: linear-gradient(90deg, rgba(4, 7, 18, .94) 0%, rgba(4, 7, 18, .72) 42%, rgba(4, 7, 18, .18) 100%), url("https://images.unsplash.com/photo-1489599849927-2ee91cede3ba?auto=format&fit=crop&w=2200&q=85") center/cover;
+        box-shadow: 0 22px 70px rgba(0, 0, 0, .48);
+    }
+
+    .landing-copy { max-width: 650px; }
+    .landing-kicker { color: #f87171; font-size: .82rem; font-weight: 700; letter-spacing: 2px; text-transform: uppercase; }
+    .landing-title { color: #fff; font-size: clamp(2.8rem, 6vw, 5.8rem); line-height: .96; margin: 12px 0 20px; font-weight: 700; }
+    .landing-subtitle { color: #dbeafe; font-size: 1.15rem; line-height: 1.6; max-width: 560px; }
+    .landing-note { color: #cbd5e1; font-size: .82rem; margin-top: 14px; }
+
     /* Glass Cards */
     .glass-card {
         background: rgba(255, 255, 255, 0.05);
@@ -185,14 +201,92 @@ def img_stretch(image_src):
         return st.image(image_src, use_container_width=True)
 
 
+def get_poster_source(movie_row):
+    """Return a real poster source, or empty when artwork is unavailable."""
+    poster_url = movie_row.get("full_poster_url") or movie_row.get("poster_path")
+    if not poster_url or str(poster_url).strip().lower() in ("nan", "none"):
+        poster_url = engine.resolve_poster_url(
+            movie_row.get("title", ""), str(movie_row.get("year", ""))
+        )
+    if not poster_url:
+        return ""
+    poster_url = str(poster_url).strip()
+    if poster_url.startswith("http"):
+        return poster_url
+    if poster_url.startswith("/"):
+        return f"https://image.tmdb.org/t/p/w500{poster_url}"
+    return f"https://image.tmdb.org/t/p/w500/{poster_url}"
+
+
+def catalog_filter_options(dataframe, column_names):
+    """Build filter options from the first matching dataset column."""
+    for column_name in column_names:
+        if column_name in dataframe.columns:
+            if column_name.startswith("parsed_"):
+                values = sorted({item for items in dataframe[column_name] for item in items if item})
+                return values, column_name
+            values = dataframe[column_name].dropna().astype(str).str.strip()
+            values = sorted({value for value in values if value and value.lower() not in ("nan", "none", "[]")})
+            if values:
+                return values, column_name
+    return [], None
+
+
+def apply_catalog_filters(dataframe, query, genre, year, production, country, min_rating, sort_order):
+    filtered = dataframe.copy()
+    release_dates = filtered.get("release_date", pd.Series("", index=filtered.index))
+    year_values = filtered["year"] if "year" in filtered.columns else release_dates.astype(str).str.extract(r'(\d{4})', expand=False)
+    filtered = filtered.assign(_catalog_year=year_values.fillna("N/A").astype(str))
+    if query.strip():
+        filtered = filtered[filtered["title"].str.contains(query.strip(), case=False, na=False)]
+    if genre != "All":
+        filtered = filtered[filtered["parsed_genres"].apply(lambda values: genre in values)]
+    if year != "All":
+        filtered = filtered[filtered["_catalog_year"] == str(year)]
+    if production != "All":
+        production_column = next((name for name in ("parsed_production_companies", "production_companies", "production_house", "network", "networks") if name in filtered.columns), None)
+        if production_column:
+            if production_column.startswith("parsed_"):
+                filtered = filtered[filtered[production_column].apply(lambda values: production in values)]
+            else:
+                filtered = filtered[filtered[production_column].astype(str).str.contains(production, case=False, na=False)]
+    if country != "All":
+        country_column = next((name for name in ("parsed_countries", "production_countries", "country", "countries") if name in filtered.columns), None)
+        if country_column:
+            if country_column.startswith("parsed_"):
+                filtered = filtered[filtered[country_column].apply(lambda values: country in values)]
+            else:
+                filtered = filtered[filtered[country_column].astype(str).str.contains(country, case=False, na=False)]
+    filtered = filtered[filtered["vote_average"] >= min_rating]
+    sort_map = {
+        "Title A-Z": ("title", True), "Title Z-A": ("title", False),
+        "Latest release": ("release_date", False), "Oldest release": ("release_date", True),
+        "Revenue": ("revenue", False), "Most voted": ("vote_count", False),
+    }
+    sort_column, ascending = sort_map.get(sort_order, ("popularity", False))
+    if sort_column not in filtered.columns:
+        sort_column = "popularity"
+    return filtered.drop(columns=["_catalog_year"], errors="ignore").sort_values(sort_column, ascending=ascending, na_position="last")
+
+
 # ─── Load Services ─────────────────────────────────────────────────────────────
 @st.cache_resource
 def load_app_services():
     auth = AuthManager()
     engine = RecommenderEngine()
+    engine.add_training_ratings(auth.get_all_ratings())
     return auth, engine
 
 auth, engine = load_app_services()
+
+# Native OIDC opens Google's account chooser and validates the returned identity.
+if st.user.is_logged_in and not st.session_state.get("user_id"):
+    oauth_user_id, _ = auth.login_oauth_user(
+        st.user.email,
+        getattr(st.user, "name", "") or st.user.email.split("@")[0],
+        st.user.sub,
+    )
+    st.session_state.user_id = oauth_user_id
 
 # ─── Session State Initialization ─────────────────────────────────────────────
 if "user_id" not in st.session_state:
@@ -201,6 +295,79 @@ if "selected_movie_id" not in st.session_state:
     st.session_state.selected_movie_id = None
 if "page" not in st.session_state:
     st.session_state.page = "home"  # "home" | "detail"
+if "landing_complete" not in st.session_state:
+    st.session_state.landing_complete = False
+
+
+def render_landing_page():
+    st.markdown(
+        "<section class='landing-page'><div class='landing-copy'>"
+        "<div class='landing-kicker'>AI-powered movie discovery</div>"
+        "<div class='landing-title'>Find your next obsession.</div>"
+        "<div class='landing-subtitle'>WatchWise learns what you love, predicts what you will enjoy, and turns every rating into a better watchlist.</div>"
+        "</div></section>",
+        unsafe_allow_html=True,
+    )
+    st.markdown("### Choose how you want to watch")
+    guest_col, account_col = st.columns(2, gap="large")
+    with guest_col:
+        if st.button("Continue without login", key="landing_guest", type="primary", use_container_width=True):
+            st.session_state.landing_complete = True
+            st.rerun()
+        st.caption("Browse movies, search titles, filter the catalog, and view details.")
+    with account_col:
+        if st.button("Continue with an account", key="landing_account", use_container_width=True):
+            st.session_state.landing_complete = "login"
+            st.rerun()
+        st.caption("Save ratings, unlock predictions, recommendations, and your taste profile.")
+
+
+def render_landing_login():
+    st.markdown("## Sign in to WatchWise")
+    st.caption("Use your WatchWise account to keep ratings and recommendations across sessions.")
+    login_email = st.text_input("Email", key="landing_login_email")
+    login_password = st.text_input("Password", type="password", key="landing_login_password")
+    if st.button("Sign in", key="landing_signin", type="primary", use_container_width=True):
+        user_id, _ = auth.login(login_email, login_password)
+        if user_id:
+            st.session_state.user_id = user_id
+            st.session_state.landing_complete = True
+            st.rerun()
+        st.error("Invalid email or password.")
+
+    st.divider()
+    st.markdown("#### Other sign-in options")
+    firebase_config = st.secrets.get("firebase", {})
+    firebase_ready = all(firebase_config.get(key) for key in ("api_key", "auth_domain", "project_id", "app_id"))
+    google_auth = st.secrets.get("auth", {}).get("google", {})
+    google_ready = bool(google_auth.get("client_id") and google_auth.get("client_secret"))
+    if st.button("Continue with Google", key="landing_google", use_container_width=True):
+        if google_ready:
+            st.login("google")
+        else:
+            st.warning("Google OAuth is not configured yet. Add the [auth] settings from FIREBASE_SETUP.md.")
+    with st.expander("Create a new account"):
+        signup_email = st.text_input("Email", key="landing_signup_email")
+        signup_name = st.text_input("Display name", key="landing_signup_name")
+        signup_password = st.text_input("Password (8+ characters)", type="password", key="landing_signup_password")
+        if st.button("Create account", key="landing_signup", use_container_width=True):
+            user_id, _ = auth.register_user(signup_email, signup_password, signup_name)
+            if user_id:
+                st.session_state.user_id = user_id
+                st.session_state.landing_complete = True
+                st.rerun()
+            st.error("Use an unused email and a password of at least 8 characters.")
+    if st.button("Back", key="landing_back"):
+        st.session_state.landing_complete = False
+        st.rerun()
+
+
+if not st.session_state.landing_complete:
+    render_landing_page()
+    st.stop()
+if st.session_state.landing_complete == "login":
+    render_landing_login()
+    st.stop()
 
 
 # ─── Sidebar Authentication & Controls ────────────────────────────────────────
@@ -209,29 +376,38 @@ with st.sidebar:
     st.caption("Multi-Model Movie Recommender System")
     st.divider()
 
-    # User Profile Switcher
+    # Account login and registration
     if st.session_state.user_id:
         user_info = auth.get_user_profile(st.session_state.user_id)
-        st.success(f"🔒 Logged In as **{user_info.get('username')}**")
+        st.success(f"🔒 Logged in as **{user_info.get('email')}**")
         if btn_stretch("🚪 Logout"):
+            auth.logout(st.session_state.user_id)
             st.session_state.user_id = None
+            if st.user.is_logged_in:
+                st.logout()
             st.rerun()
     else:
         st.info("🔓 Guest Mode (Public Access)")
         st.markdown("### 🔐 User Login")
-        login_option = st.selectbox("Select User Profile", options=list(auth.users.keys()), format_func=lambda uid: auth.users[uid]["username"])
-        if btn_stretch("Log In Profile", type="primary"):
-            st.session_state.user_id = login_option
-            st.rerun()
+        login_email = st.text_input("Email", key="login_email")
+        login_password = st.text_input("Password", type="password", key="login_password")
+        if btn_stretch("Log In", type="primary"):
+            user_id, _ = auth.login(login_email, login_password)
+            if user_id:
+                st.session_state.user_id = user_id
+                st.rerun()
+            st.error("Invalid email or password.")
 
-        with st.expander("➕ Register New User"):
-            new_name = st.text_input("Username")
-            if st.button("Create Profile"):
-                if new_name:
-                    new_uid, _ = auth.register_user(new_name)
+        with st.expander("➕ Create account"):
+            signup_email = st.text_input("Signup email", key="signup_email")
+            signup_name = st.text_input("Display name", key="signup_name")
+            signup_password = st.text_input("Signup password (8+ characters)", type="password", key="signup_password")
+            if st.button("Create Account"):
+                new_uid, _ = auth.register_user(signup_email, signup_password, signup_name)
+                if new_uid:
                     st.session_state.user_id = new_uid
-                    st.success("Account created!")
                     st.rerun()
+                st.error("Use a valid unused email and a password of at least 8 characters.")
 
     st.divider()
     st.markdown("### ⚙️ Quick Filters")
@@ -255,20 +431,18 @@ def render_movie_card(movie_row, key_prefix="card", show_predicted=True, rank_nu
     rating = movie_row.get("vote_average", 0.0)
     mid = str(movie_row.get("movie_id", ""))
     
-    # Poster URL or placeholder
-    poster_url = movie_row.get("full_poster_url") or movie_row.get("poster_path")
-    if poster_url and str(poster_url).strip() and str(poster_url).lower() != "nan":
-        p_str = str(poster_url).strip()
-        if p_str.startswith("http"):
-            image_src = p_str
-        elif p_str.startswith("/"):
-            image_src = f"https://image.tmdb.org/t/p/w500{p_str}"
-        else:
-            image_src = f"https://image.tmdb.org/t/p/w500/{p_str}"
+    image_src = get_poster_source(movie_row)
+    if image_src:
+        img_stretch(image_src)
     else:
-        image_src = f"https://placehold.co/300x450/1e1b4b/d8b4fe?text={title.replace(' ', '+')}"
-
-    img_stretch(image_src)
+        st.markdown(
+            "<div style='height:260px;display:flex;align-items:center;justify-content:center;"
+            "background:linear-gradient(145deg,#25233f,#111827);border:1px solid rgba(255,255,255,.15);"
+            "border-radius:10px;color:#a5b4fc;text-align:center;padding:18px;'>"
+            "<div><div style='font-size:2.4rem;'>🎞️</div><div>Poster unavailable</div>"
+            "<small>Movie details are still available</small></div></div>",
+            unsafe_allow_html=True,
+        )
     
     rank_badge = f"<span class='badge badge-purple'>#{rank_num}</span> " if rank_num else ""
     st.markdown(f"{rank_badge}**{title}** ({year})", unsafe_allow_html=True)
@@ -278,8 +452,15 @@ def render_movie_card(movie_row, key_prefix="card", show_predicted=True, rank_nu
     
     if show_predicted and st.session_state.user_id:
         u_profile = auth.get_user_profile(st.session_state.user_id)
-        p_rating = engine.predict_rating(st.session_state.user_id, mid, user_ratings=u_profile.get("ratings", {}))
-        st.markdown(f"<span class='badge badge-green'>For You: ⭐ {round(p_rating, 1)}/5</span>", unsafe_allow_html=True)
+        known_rating = u_profile.get("ratings", {}).get(mid)
+        if known_rating is None:
+            if len(u_profile.get("ratings", {})) >= 3:
+                p_rating = engine.predict_rating(st.session_state.user_id, mid)
+                st.markdown(f"<span class='badge badge-green'>Predicted for you: ⭐ {round(p_rating, 1)}/5</span>", unsafe_allow_html=True)
+            else:
+                st.caption("Rate 3 movies to unlock predictions")
+        else:
+            st.markdown(f"<span class='badge badge-cyan'>Your rating: ⭐ {round(float(known_rating), 1)}/5</span>", unsafe_allow_html=True)
         
     # ── Details button → navigate to detail page ──
     if btn_stretch("Details ℹ️", key=f"{key_prefix}_details_{mid}"):
@@ -306,6 +487,7 @@ def render_movie_card(movie_row, key_prefix="card", show_predicted=True, rank_nu
         with c3:
             user_rating = u_profile.get("ratings", {}).get(mid, 0)
             st.caption(f"Rated: {user_rating}★" if user_rating else "-")
+    return True
 
 
 # ─── Detail Page ───────────────────────────────────────────────────────────────
@@ -346,16 +528,16 @@ def render_detail_page():
     popularity  = m_info.get("popularity", 0)
     runtime     = m_info.get("runtime", None)
 
-    # Poster URL
-    poster_url = m_info.get("full_poster_url") or m_info.get("poster_path", "")
-    if poster_url and str(poster_url).strip() and str(poster_url).lower() not in ("nan", "none", ""):
-        p_str = str(poster_url).strip()
-        poster_src = p_str if p_str.startswith("http") else (
-            f"https://image.tmdb.org/t/p/w500{p_str}" if p_str.startswith("/")
-            else f"https://image.tmdb.org/t/p/w500/{p_str}"
+    poster_src = get_poster_source(m_info)
+    if not poster_src:
+        st.markdown(
+            "<div style='height:420px;display:flex;align-items:center;justify-content:center;"
+            "background:linear-gradient(145deg,#25233f,#111827);border:1px solid rgba(255,255,255,.15);"
+            "border-radius:12px;color:#a5b4fc;text-align:center;'>🎞️ Poster unavailable</div>",
+            unsafe_allow_html=True,
         )
     else:
-        poster_src = f"https://placehold.co/300x450/1e1b4b/d8b4fe?text={title.replace(' ', '+')}"
+        img_stretch(poster_src)
 
     # ── Back button ────────────────────────────────────────────────────────────
     if st.button("← Back to Browse", key="detail_back_top"):
@@ -385,12 +567,21 @@ def render_detail_page():
         # Personalized prediction badge
         if st.session_state.user_id:
             u_profile = auth.get_user_profile(st.session_state.user_id)
-            pred = engine.predict_rating(st.session_state.user_id, mid, user_ratings=u_profile.get("ratings", {}))
+            user_rating = u_profile.get("ratings", {}).get(mid)
+            if user_rating is None:
+                if len(u_profile.get("ratings", {})) >= 3:
+                    pred = engine.predict_rating(st.session_state.user_id, mid)
+                    rating_label = f"🎯 Predicted for you: ⭐ {round(pred, 1)} / 5.0"
+                    rating_class = "badge-green"
+                else:
+                    rating_label = "Rate 3 movies to unlock predicted ratings"
+                    rating_class = "badge-amber"
+            else:
+                rating_label = f"⭐ Your rating: {round(float(user_rating), 1)} / 5.0"
+                rating_class = "badge-cyan"
             st.markdown(
-                f"<div style='text-align:center'>"
-                f"<span class='badge badge-green' style='font-size:1rem;padding:8px 16px;'>🎯 For You: ⭐ {round(pred,1)} / 5.0</span>"
-                f"</div>",
-                unsafe_allow_html=True
+                f"<div style='text-align:center'><span class='badge {rating_class}' style='font-size:1rem;padding:8px 16px;'>{rating_label}</span></div>",
+                unsafe_allow_html=True,
             )
 
         # Like / Watchlist buttons
@@ -443,6 +634,22 @@ def render_detail_page():
             st.markdown(f"**🎬 Director:** {', '.join(director)}")
         if cast:
             st.markdown(f"**🎭 Cast:** {', '.join(cast[:5])}")
+
+        if st.session_state.user_id:
+            existing_rating = auth.get_rating(st.session_state.user_id, mid)
+            st.markdown("#### ⭐ Rate This Movie")
+            rating_choice = st.radio(
+                "Your rating",
+                options=[1, 2, 3, 4, 5],
+                index=(int(existing_rating) - 1 if existing_rating else None),
+                format_func=lambda value: "★" * value,
+                horizontal=True,
+                key=f"detail_rating_{mid}",
+            )
+            if st.button("Save Rating", key=f"save_rating_{mid}", type="primary"):
+                if auth.add_user_rating(st.session_state.user_id, mid, rating_choice, title):
+                    st.success("Thanks for rating! Your recommendation model will use it after the next refresh.")
+                    st.rerun()
 
     # ── Where to Watch ────────────────────────────────────────────────────────
     st.divider()
@@ -546,6 +753,55 @@ else:
     # TAB 1: EXPLORE & TOP N MOVIES (GUEST FEATURES)
     # ==========================================
     with tab_explore:
+        st.markdown("### 🔎 Find Your Next Movie")
+        catalog_title_options = sorted(engine.movies_df["title"].dropna().astype(str).unique().tolist(), key=str.casefold)
+        selected_catalog_title = st.selectbox(
+            "Search movie titles",
+            options=catalog_title_options,
+            index=None,
+            key="catalog_search",
+            placeholder="Type a title to see matching movies",
+        )
+        search_query = selected_catalog_title or ""
+        if search_query:
+            st.caption("Matching title selected. Movies without posters still show their full details.")
+
+        with st.expander("Filters", expanded=True):
+            filter_col1, filter_col2, filter_col3 = st.columns(3)
+            genre_filter_options = ["All"] + sorted({genre for values in engine.movies_df["parsed_genres"] for genre in values})
+            catalog_years = engine.movies_df["year"] if "year" in engine.movies_df.columns else engine.movies_df.get("release_date", pd.Series("", index=engine.movies_df.index)).astype(str).str.extract(r'(\d{4})', expand=False).fillna("N/A")
+            year_filter_options = ["All"] + sorted(catalog_years.dropna().astype(str).unique().tolist(), reverse=True)
+            production_values, production_column = catalog_filter_options(engine.movies_df, ["parsed_production_companies", "production_companies", "production_house", "network", "networks"])
+            country_values, country_column = catalog_filter_options(engine.movies_df, ["parsed_countries", "production_countries", "country", "countries"])
+            with filter_col1:
+                catalog_genre = st.selectbox("Genre", genre_filter_options, key="catalog_genre")
+                catalog_year = st.selectbox("Year", year_filter_options, key="catalog_year")
+            with filter_col2:
+                catalog_production = st.selectbox("Network / production house", ["All"] + production_values, key="catalog_production")
+                catalog_country = st.selectbox("Country", ["All"] + country_values, key="catalog_country")
+            with filter_col3:
+                catalog_rating = st.slider("Minimum rating", 0.0, 10.0, 0.0, 0.1, key="catalog_rating")
+                catalog_sort = st.selectbox("Sort", ["Most popular", "Title A-Z", "Title Z-A", "Latest release", "Oldest release", "Revenue", "Most voted"], key="catalog_sort")
+            if not production_column:
+                st.caption("Production-house data is not available in this catalog.")
+            if not country_column:
+                st.caption("Country data is not available in this catalog.")
+
+        filtered_catalog = apply_catalog_filters(
+            engine.movies_df, search_query, catalog_genre, catalog_year,
+            catalog_production, catalog_country, catalog_rating, catalog_sort,
+        )
+        if search_query or catalog_genre != "All" or catalog_year != "All" or catalog_rating > 0 or catalog_sort != "Most popular":
+            st.markdown(f"#### {len(filtered_catalog)} results")
+            if filtered_catalog.empty:
+                st.info("No movies match these filters with available poster artwork.")
+            else:
+                result_cols = st.columns(5)
+                for i, (_, row) in enumerate(filtered_catalog.head(50).iterrows()):
+                    with result_cols[i % 5]:
+                        render_movie_card(row, key_prefix=f"catalog_{i}")
+            st.divider()
+
         st.markdown("### 🏆 Top Ranked Movies (IMDb Weighted Rating Formula)")
         st.caption("Evaluates IMDb Weighted Rating $WR = \\frac{v}{v+m}R + \\frac{m}{v+m}C$ across all movies")
         
@@ -647,7 +903,15 @@ else:
         st.markdown("### 🔍 Content-Based NLP Similarity Engine")
         st.caption("Uses TF-IDF Vectorization & Cosine Similarity over Plot Overviews, Genres, Cast, and Directors")
 
-        search_query = st.selectbox("Select or Type a Movie Title", options=[""] + [t.title() for t in all_titles[:500]])
+        nlp_title_options = sorted(engine.movies_df["title"].dropna().astype(str).unique().tolist(), key=str.casefold)
+        selected_nlp_title = st.selectbox(
+            "Search movie title",
+            options=nlp_title_options,
+            index=None,
+            key="nlp_title_search",
+            placeholder="Type a title to see matching movies",
+        )
+        search_query = selected_nlp_title or ""
         
         col_s1, col_s2, col_s3 = st.columns(3)
         with col_s1:
@@ -703,8 +967,9 @@ else:
                     if st.button("Submit Rating & Retrain"):
                         m_details = engine.get_movie_details(rate_movie_title)
                         if m_details:
-                            auth.add_user_rating(st.session_state.user_id, m_details['movie_id'], rate_val)
-                            st.success(f"Rated {rate_movie_title} {rate_val}★! Model updated in real-time.")
+                            movie_id = m_details['movie_id']
+                            auth.add_user_rating(st.session_state.user_id, movie_id, rate_val)
+                            st.success(f"Rated {rate_movie_title} {rate_val}★! Your rating is saved for the next model refresh.")
                             st.rerun()
 
             st.divider()
@@ -723,6 +988,32 @@ else:
                         st.markdown(f"<span class='badge badge-cyan'>Match: {row.get('match_percentage', 0)}%</span>", unsafe_allow_html=True)
                         render_movie_card(row, key_prefix=f"hybrid_{i}")
 
+            st.divider()
+            st.markdown("#### 📊 Your Taste Profile")
+            history = auth.get_ratings_history(st.session_state.user_id)
+            if not history:
+                st.info("Rate a few movies to build your taste profile.")
+            else:
+                history_df = pd.DataFrame(history)
+                rated_movies = engine.movies_df[engine.movies_df["movie_id"].astype(str).isin(history_df["movie_id"].astype(str))]
+                rated_movies = rated_movies.merge(history_df, on="movie_id", how="inner")
+                high_rated = rated_movies[rated_movies["rating"] >= 4]
+                genre_counts = pd.Series([genre for genres in high_rated["parsed_genres"] for genre in genres]).value_counts().head(5)
+                c1, c2 = st.columns(2)
+                with c1:
+                    st.caption("Top genres you love")
+                    if not genre_counts.empty:
+                        st.bar_chart(genre_counts)
+                with c2:
+                    st.caption("Rating distribution")
+                    distribution = history_df["rating"].round().value_counts().sort_index()
+                    st.bar_chart(distribution)
+                directors = pd.Series([director for directors in high_rated["parsed_director"] for director in directors]).value_counts().head(5)
+                st.caption("Directors you rate highly")
+                st.write(", ".join(directors.index.tolist()) if not directors.empty else "Not enough high ratings yet.")
+                st.caption("Ratings history")
+                st.dataframe(history_df, hide_index=True, use_container_width=True)
+
 
     # ==========================================
     # TAB 4: MOVIE DETAILS & USER-AWARE RECS
@@ -737,18 +1028,11 @@ else:
             col_d1, col_d2 = st.columns([1, 2])
 
             with col_d1:
-                p_url = m_info.get("full_poster_url") or m_info.get("poster_path")
-                if p_url and str(p_url).strip() and str(p_url).lower() != "nan":
-                    p_str = str(p_url).strip()
-                    if p_str.startswith("http"):
-                        d_img_src = p_str
-                    elif p_str.startswith("/"):
-                        d_img_src = f"https://image.tmdb.org/t/p/w500{p_str}"
-                    else:
-                        d_img_src = f"https://image.tmdb.org/t/p/w500/{p_str}"
+                d_img_src = get_poster_source(m_info)
+                if d_img_src:
+                    img_stretch(d_img_src)
                 else:
-                    d_img_src = f"https://placehold.co/300x450/1e1b4b/d8b4fe?text={m_info['title'].replace(' ', '+')}"
-                img_stretch(d_img_src)
+                    st.info("Poster artwork unavailable for this movie.")
 
             with col_d2:
                 st.markdown(f"**Genres:** {', '.join(m_info.get('parsed_genres', []))}")

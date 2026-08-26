@@ -18,6 +18,7 @@ venv/
 
 # User private data (ratings, watchlists)
 datasets/user_data.json
+datasets/watchwise.db
 
 # Large datasets - exclude raw CSV if too big
 # datasets/latest_movies_2026.csv  # Keeping this tracked
